@@ -24,6 +24,8 @@ from pydantic import BaseModel, Field
 from fastmcp import FastMCP
 # If you need Context/Image types for tools:
 from fastmcp.types import Context, Image  # FastMCP exposes these
+except ImportError:
+    from fastmcp import Context, Image  # incase fastmcp>=2.12 keeps these 
 
 # LLM router (single API for OpenAI/xAI/Anthropic/etc.)
 import litellm
