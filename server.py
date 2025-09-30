@@ -85,12 +85,18 @@ def _generate_text_core(args: GenerateArgs) -> str:
     if args.system:
         messages.append({"role": "system", "content": args.system})
     messages.append({"role": "user", "content": args.prompt})
-    resp = litellm.completion(
+
+    try:
+        resp = litellm.completion(
         model=model,
         messages=messages,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
-    )
+        )
+    except Exception as e:
+        logger.error(f"Error generating text: {e}")
+        return f"Error generating text: {e}"
+    
     # Try OpenAI-style first
     try:
         return resp.choices[0].message.content  # type: ignore[attr-defined]
