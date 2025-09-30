@@ -792,18 +792,17 @@ def health():
 # Entrypoint
 # ---------------------------------------
 def main() -> None:
-    import threading
-
-    # Start MCP HTTP (Blender or other MCP clients can connect here if desired)
-    def run_mcp() -> None:
-        mcp.run(transport="http", host="127.0.0.1", port=8974, path="/mcp")
-
-    t = threading.Thread(target=run_mcp, daemon=True)
-    t.start()
-
-    # Start REST shim for the simple add-on HTTP client
-    uvicorn.run(app, host="127.0.0.1", port=8975)
-
+    from fastmcp.server.sse import create_sse_handler
+    
+    # Mount MCP SSE endpoint onto the existing FastAPI app
+    @app.post("/mcp")
+    async def mcp_endpoint(request: Request):
+        handler = create_sse_handler(mcp)
+        return await handler(request)
+    
+    # Run unified server on port 8080 (FastMCP Cloud standard)
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
