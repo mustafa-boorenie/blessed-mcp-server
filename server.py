@@ -30,7 +30,7 @@ except ImportError:
 
 # LLM router (single API for OpenAI/xAI/Anthropic/etc.)
 import litellm
-
+litellm.drop_params = True
 # Optional REST shim for simple clients (e.g., Blender add-on) to call a tool over HTTP
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
