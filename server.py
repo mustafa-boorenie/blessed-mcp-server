@@ -19,7 +19,7 @@ import threading
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-
+from fastapi import Request
 # MCP core
 from fastmcp import FastMCP
 # If you need Context/Image types for tools:
@@ -792,15 +792,17 @@ def health():
 # Entrypoint
 # ---------------------------------------
 def main() -> None:
-    from fastmcp.server.sse import create_sse_handler
+    from fastmcp.server.sse import get_sse_handler
     
-    # Mount MCP SSE endpoint onto the existing FastAPI app
+    # Add MCP endpoint to the existing FastAPI app
     @app.post("/mcp")
+    @app.get("/mcp")
     async def mcp_endpoint(request: Request):
-        handler = create_sse_handler(mcp)
+        # Use FastMCP's SSE handler
+        handler = get_sse_handler(mcp)
         return await handler(request)
     
-    # Run unified server on port 8080 (FastMCP Cloud standard)
+    # Now run the unified app (which has both /mcp and /tools/call)
     port = int(os.getenv("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
 
