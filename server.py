@@ -13,7 +13,7 @@ import tempfile
 import logging
 import inspect
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable, Iterator
 from urllib.parse import urlparse
 import threading
 
@@ -33,7 +33,7 @@ import litellm
 litellm.drop_params = True
 # Optional REST shim for simple clients (e.g., Blender add-on) to call a tool over HTTP
 from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 # ---------------------------------------
@@ -55,9 +55,9 @@ load_dotenv()
 
 # Public model aliases -> env overrides (edit at runtime via .env)
 MODEL_MAP = {
-    "gpt-5":        os.getenv("OPENAI_MODEL",  "gpt-5"),
-    "grok-4-fast":  os.getenv("XAI_MODEL",     "grok-4-fast"),
-    "claude-4":     os.getenv("ANTHROPIC_MODEL","claude-4"),
+    "gpt-5": os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini"),
+    "grok-4-fast": os.getenv("XAI_MODEL", "xai/grok-beta"),
+    "claude-4": os.getenv("ANTHROPIC_MODEL", "anthropic/claude-3-5-sonnet-latest"),
 }
 REST_TOKEN = os.getenv("MCP_REST_TOKEN", "")
 
@@ -75,27 +75,49 @@ class GenerateArgs(BaseModel):
     system: Optional[str] = None
     temperature: float = 0.2
     max_tokens: int = 1024
+    stream: bool = False
 
-def _resolve_model(model_alias_or_id: str) -> str:
-    return MODEL_MAP.get(model_alias_or_id, model_alias_or_id)
 
-def _generate_text_core(args: GenerateArgs) -> str:
-    model = _resolve_model(args.model)
-    messages: List[dict] = []
+def _build_messages(args: GenerateArgs) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = []
     if args.system:
         messages.append({"role": "system", "content": args.system})
     messages.append({"role": "user", "content": args.prompt})
+    return messages
+
+def _resolve_model(model_alias_or_id: str) -> str:
+    resolved = MODEL_MAP.get(model_alias_or_id, model_alias_or_id)
+    if not resolved:
+        raise ValueError(f"No model configured for alias '{model_alias_or_id}'")
+    return resolved
+
+def _generate_text_core(args: GenerateArgs) -> str:
+    model = _resolve_model(args.model)
+    messages = _build_messages(args)
 
     try:
         resp = litellm.completion(
-        model=model,
-        messages=messages,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
+            model=model,
+            messages=messages,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            stream=args.stream,
         )
-    except Exception as e:
-        logger.error(f"Error generating text: {e}")
-        return f"Error generating text: {e}"
+    except Exception as exc:
+        logger.error("LiteLLM completion failed (model=%s): %s", model, exc, exc_info=True)
+        return f"Error generating text: {exc}"
+
+    if args.stream:
+        chunks: List[str] = []
+        for chunk in resp:
+            try:
+                delta = chunk["choices"][0]["delta"].get("content") or ""
+            except Exception as chunk_exc:
+                logger.warning("Unexpected stream payload from LiteLLM: %s", chunk_exc, exc_info=True)
+                continue
+            if delta:
+                chunks.append(delta)
+        return "".join(chunks)
     
     # Try OpenAI-style first
     try:
@@ -112,6 +134,44 @@ def _generate_text_core(args: GenerateArgs) -> str:
 def generate_text(ctx: Context, args: GenerateArgs) -> str:
     """Unified text generation via LiteLLM."""
     return _generate_text_core(args)
+
+
+def _sse_event(event: str, data: Optional[Dict[str, Any]] = None) -> str:
+    payload = "" if data is None else json.dumps(data)
+    parts = [f"event: {event}"]
+    if payload:
+        parts.append(f"data: {payload}")
+    return "\n".join(parts) + "\n\n"
+
+
+def _generate_text_stream(args: GenerateArgs) -> Iterator[str]:
+    model = _resolve_model(args.model)
+    messages = _build_messages(args)
+    try:
+        stream = litellm.completion(
+            model=model,
+            messages=messages,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            stream=True,
+        )
+    except Exception as exc:
+        logger.error("LiteLLM streaming failed (model=%s): %s", model, exc, exc_info=True)
+        yield _sse_event("error", {"message": str(exc)})
+        yield _sse_event("done")
+        return
+
+    for chunk in stream:
+        try:
+            delta = chunk["choices"][0]["delta"].get("content") or ""
+        except Exception as chunk_exc:
+            logger.warning("Unexpected LiteLLM stream payload: %s", chunk_exc, exc_info=True)
+            continue
+        if not delta:
+            continue
+        yield _sse_event("delta", {"text": delta})
+
+    yield _sse_event("done")
 
 # ---------------------------------------
 # Blender connection layer (YOUR IMPLEM)
@@ -777,8 +837,26 @@ def _format_tool_response(tool_name: str, result: Any) -> Dict[str, Any]:
 
 @app.post("/tools/call")
 def tools_call(body: ToolCall, _=Depends(_auth)):
+    arguments = body.arguments or {}
+
+    if body.tool_name == "generate_text" and arguments.get("stream"):
+        try:
+            args = GenerateArgs(**arguments)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        stream_iter = _generate_text_stream(args)
+        return StreamingResponse(
+            stream_iter,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     try:
-        result = _call_tool(body.tool_name, body.arguments or {})
+        result = _call_tool(body.tool_name, arguments)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Unknown tool: {body.tool_name}")
     except ValueError as exc:
